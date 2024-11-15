@@ -28,7 +28,7 @@ attendance_urls = [
     "https://dl.nure.ua/mod/attendance/view.php?id=566211&view=5",  # МНАВ
     "https://dl.nure.ua/mod/attendance/view.php?id=579505&view=5",  # NoSql
     "https://dl.nure.ua/mod/attendance/view.php?id=566346&view=5",  # JavaScript
-    "https://dl.nure.ua/mod/attendance/view.php?id=566231",  # ИАД
+    "https://dl.nure.ua/mod/attendance/view.php?id=566231",         # ИАД
     "https://dl.nure.ua/mod/attendance/view.php?id=566186&view=5",  # СА
     "https://dl.nure.ua/mod/attendance/view.php?id=559051&view=5",  # логика
 ]
@@ -86,18 +86,8 @@ def send_telegram_message(message):
 
 # Планируем автоматическую отметку по времени
 def schedule_check():
-    login()
-    mark_attendance()# Логинимся один раз перед проверкой
-    schedule.every().day.at("07:45").do(mark_attendance)
-    schedule.every().day.at("9:42").do(mark_attendance)
-    schedule.every().day.at("11:15").do(mark_attendance)
-    schedule.every().day.at("13:18").do(mark_attendance)
-    schedule.every().day.at("14:55").do(mark_attendance)
-    schedule.every().day.at("16:40").do(mark_attendance)
-
-
-# Запускаем процесс
-schedule_check()
+    login()# Логинимся один раз перед проверкой
+    mark_attendance()
 
 while True:
     schedule.run_pending()
