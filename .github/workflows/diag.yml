@@ -1,0 +1,16 @@
+name: diag
+on: workflow_dispatch
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
+          ip=$(curl -s https://ipinfo.io/json | tr -d '\n ' | head -c 200); echo "::warning::runner $ip"
+          for u in https://dl.nure.ua/ https://dl.nure.ua/login/index.php; do
+            r=$(curl -s -o /tmp/b -w '%{http_code} %{size_download}B' -A "$UA" "$u"); echo "::warning::GET(browserUA) $u -> $r :: $(head -c 150 /tmp/b | tr -d '\n')"
+            r=$(curl -s -o /tmp/b -w '%{http_code}' -A "python-requests/2.32" "$u"); echo "::warning::GET(pyUA) $u -> $r"
+          done
+          r=$(curl -s -o /tmp/b -w '%{http_code}' -A "$UA" -d 'username=x&password=y&logintoken=z' https://dl.nure.ua/login/index.php); echo "::warning::POST login -> $r :: $(head -c 150 /tmp/b | tr -d '\n')"
+          r=$(curl -s -o /tmp/b -w '%{http_code}' -A "$UA" -d 'username=x&password=y&service=moodle_mobile_app' https://dl.nure.ua/login/token.php); echo "::warning::POST token.php -> $r :: $(head -c 120 /tmp/b | tr -d '\n')"
+          curl -sI -A "$UA" https://dl.nure.ua/login/index.php | head -12 | while read l; do echo "::warning::H $l"; done
