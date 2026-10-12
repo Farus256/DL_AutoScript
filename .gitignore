@@ -5,3 +5,4 @@ __pycache__/
 attendance.log*
 .labels.json
 .plan_state
+.wake_windows.json

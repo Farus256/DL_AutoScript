@@ -248,12 +248,42 @@ def build_jobs(sessions: list[CalSession], now: datetime, offsets: list[int],
 CRON_BEGIN, CRON_END = "# >>> nure-attendance plan >>>", "# <<< nure-attendance plan <<<"
 
 
-def render_cron_block(jobs: list[Job], runner: str) -> str:
-    lines = [CRON_BEGIN]
+LOCK_BEFORE = timedelta(minutes=20)   # будим процессор заранее
+LOCK_AFTER = timedelta(minutes=15)    # и держим чуть после последней проверки
+LOCK_MERGE_GAP = timedelta(minutes=90)  # окна ближе этого склеиваем
+
+
+def wake_windows(jobs: list[Job]) -> list[tuple[datetime, datetime]]:
+    """Окна, когда держим wake lock: от (проверка − 20 мин) до (проверка + 15 мин), близкие склеены."""
+    wins: list[list[datetime]] = []
     for j in jobs:
-        lt = j.when.astimezone()  # время телефона — cron живёт в нём
-        lines.append(f"# {j.label.replace('%', '')}")
-        lines.append(f"{lt.minute} {lt.hour} {lt.day} {lt.month} * {runner} --only {j.cmid}")
+        a, b = j.when - LOCK_BEFORE, j.when + LOCK_AFTER
+        if wins and a - wins[-1][1] <= LOCK_MERGE_GAP:
+            wins[-1][1] = max(wins[-1][1], b)
+        else:
+            wins.append([a, b])
+    return [(a, b) for a, b in wins]
+
+
+def _cron_time(t: datetime) -> str:
+    lt = t.astimezone()  # время телефона — cron живёт в нём
+    return f"{lt.minute} {lt.hour} {lt.day} {lt.month} *"
+
+
+def render_cron_block(jobs: list[Job], runner: str, wake: str | None = None,
+                      now: datetime | None = None) -> str:
+    """wake — путь к termux/wake.sh: добавить включение/выключение wake lock вокруг пар."""
+    lines = [CRON_BEGIN]
+    events: list[tuple[datetime, str, str]] = []
+    for j in jobs:
+        events.append((j.when, f"# {j.label.replace('%', '')}", f"{_cron_time(j.when)} {runner} --only {j.cmid}"))
+    if wake:
+        for a, b in wake_windows(jobs):
+            if now is None or a > now:
+                events.append((a, "# wake lock: вкл", f"{_cron_time(a)} {wake} lock"))
+            events.append((b, "# wake lock: выкл", f"{_cron_time(b)} {wake} unlock"))
+    for _, comment, line in sorted(events, key=lambda e: e[0]):
+        lines += [comment, line]
     lines.append(CRON_END)
     return "\n".join(lines)
 
@@ -402,6 +432,28 @@ def discover_targets(nure: Nure) -> dict[str, str]:
     return targets
 
 
+def set_wake(wins: list[tuple[datetime, datetime]] | None, now: datetime) -> None:
+    """Выставить wake lock по режиму: smart — только внутри окна вокруг пар."""
+    wake = os.path.join(HERE, "termux", "wake.sh")
+    if not os.path.exists(wake) or not shutil.which("crontab"):
+        return
+    mode = os.getenv("ATTENDANCE_WAKELOCK", "smart").lower()
+    if wins is None:  # план не построился — берём окна из прошлого успешного плана
+        try:
+            wins = [(datetime.fromtimestamp(a, timezone.utc), datetime.fromtimestamp(b, timezone.utc))
+                    for a, b in json.load(open(os.path.join(HERE, ".wake_windows.json")))]
+        except (OSError, ValueError):
+            wins = []
+    if mode == "always":
+        want = "lock"
+    elif mode == "smart":
+        want = "lock" if any(a <= now <= b for a, b in wins) else "unlock"
+    else:
+        want = "unlock"
+    subprocess.run([wake, want], check=False)
+    print(f"wake lock: {want} (режим {mode})")
+
+
 def run_plan(nure: Nure, apply: bool) -> int:
     offsets = [int(x) for x in os.getenv("ATTENDANCE_OFFSETS", "30").split(",") if x.strip()]
     skip = set(ids_from_env("ATTENDANCE_SKIP_IDS"))
@@ -435,10 +487,19 @@ def run_plan(nure: Nure, apply: bool) -> int:
         if not shutil.which("crontab"):
             print("crontab не найден — --apply работает только в Termux/Linux", file=sys.stderr)
             return 2
+        mode = os.getenv("ATTENDANCE_WAKELOCK", "smart").lower()  # smart | always | off
+        wake = os.path.join(HERE, "termux", "wake.sh")
         cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
-        new = replace_cron_block(cur, render_cron_block(jobs, runner))
+        new = replace_cron_block(cur, render_cron_block(jobs, runner, wake if mode == "smart" else None, now))
         subprocess.run(["crontab", "-"], input=new, text=True, check=True)
         print("crontab обновлён")
+        wins = wake_windows(jobs)
+        try:
+            with open(os.path.join(HERE, ".wake_windows.json"), "w") as f:
+                json.dump([[a.timestamp(), b.timestamp()] for a, b in wins], f)
+        except OSError:
+            pass
+        set_wake(wins, now)
         if summary != old:
             telegram(f"📅 План на 36 ч (время Киева):\n{summary}",
                      silent=True)
@@ -468,6 +529,8 @@ def main() -> int:
     except Exception as e:
         print(f"[login] {e}", file=sys.stderr)
         telegram(f"⚠️ NURE: не удалось войти — {e}")
+        if args.plan and args.apply:
+            set_wake(None, datetime.now(timezone.utc))  # не оставлять wake lock включённым зря
         return 1
 
     if args.plan:
@@ -476,6 +539,8 @@ def main() -> int:
         except Exception as e:
             print(f"[plan] {e}", file=sys.stderr)
             telegram(f"⚠️ NURE: не удалось построить план — {e}")
+            if args.apply:
+                set_wake(None, datetime.now(timezone.utc))
             return 1
 
     skip = set(ids_from_env("ATTENDANCE_SKIP_IDS"))
