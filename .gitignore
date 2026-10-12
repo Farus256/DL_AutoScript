@@ -1,8 +1,11 @@
+.cist_cache.json
 .env
-__pycache__/
-.venv/
 .idea/
-attendance.log*
 .labels.json
+.modules.json
 .plan_state
+.plan_state.json
+.venv/
 .wake_windows.json
+__pycache__/
+attendance.log*

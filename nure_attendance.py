@@ -23,7 +23,7 @@
   ATTENDANCE_EXTRA_IDS                  — опционально, доп. id модулей через запятую
   ATTENDANCE_SKIP_IDS                   — опционально, id модулей, которые не трогать
   ATTENDANCE_OFFSETS                    — через сколько минут после начала пары проверять
-                                          (через запятую, по умолчанию "30")
+                                          (через запятую, по умолчанию "30,60")
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -44,6 +45,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 BASE = "https://dl.nure.ua"
+CIST = "https://cist.nure.ua/ias/app/tt/"
 TIMEOUT = 30
 PRESENT_RE = re.compile(r"присутн|present", re.I)
 try:
@@ -215,33 +217,83 @@ def parse_calendar_month(data: dict) -> list[CalSession]:
 
 
 @dataclass
+class Slot:
+    """Пара/занятие, вокруг которого ставим проверки."""
+    start: datetime                 # aware, UTC
+    end: datetime
+    cmids: frozenset | None         # None — проверять все известные журналы
+    label: str
+    source: str                     # "cist" — реальное расписание, "dl" — занятие в журнале DL
+    checks: list = field(default_factory=list)
+
+
+def cal_to_slots(sessions: list[CalSession]) -> list[Slot]:
+    out = []
+    for c in sessions:
+        st = datetime.fromtimestamp(c.start, timezone.utc)
+        out.append(Slot(st, st + timedelta(seconds=c.duration or 5700), frozenset({c.cmid}), c.name, "dl"))
+    return out
+
+
+def parse_cist_csv(text: str) -> list[Slot]:
+    """CSV-экспорт CIST (WEB_IAS_TT_GNR_RASP.GEN_GROUP_POTOK_RASP, ATypeDoc=3). Время — киевское."""
+    import csv
+    rows = list(csv.reader(text.replace("\r\n", "\n").replace("\r", "\n").splitlines()))
+    out = []
+    for r in rows[1:]:
+        if len(r) < 5:
+            continue
+        try:
+            st = datetime.strptime(f"{r[1]} {r[2]}", "%d.%m.%Y %H:%M:%S").replace(tzinfo=KYIV)
+            en = datetime.strptime(f"{r[3]} {r[4]}", "%d.%m.%Y %H:%M:%S").replace(tzinfo=KYIV)
+        except ValueError:
+            continue
+        label = re.sub(r"\s+\S*\d{2}-\d.*$", "", r[0]).replace(" DL", "").strip()
+        out.append(Slot(st.astimezone(timezone.utc), en.astimezone(timezone.utc), None, label, "cist"))
+    return out
+
+
+def merge_slots(cist: list[Slot], dl: list[Slot], tol: timedelta = timedelta(minutes=15)) -> list[Slot]:
+    """Пары CIST проверяют все журналы, поэтому DL-занятие, совпадающее с парой, лишнее."""
+    extra = [d for d in dl if not any(abs(d.start - c.start) <= tol for c in cist)]
+    return sorted(cist + extra, key=lambda x: x.start)
+
+
+@dataclass
 class Job:
     when: datetime      # aware, UTC — момент проверки
-    cmid: str
-    label: str
-    course: str = ""
-    start: datetime | None = None
+    cmids: set | None   # None — все журналы
+    labels: list
 
 
-def build_jobs(sessions: list[CalSession], now: datetime, offsets: list[int],
+def build_jobs(slots: list[Slot], now: datetime, offsets: list[int],
                horizon: timedelta = timedelta(hours=36)) -> list[Job]:
-    """Проверка через N минут после начала. Если момент уже прошёл, но пара ещё идёт — ближайшая минута."""
-    jobs: dict[tuple, Job] = {}
-    for s in sessions:
-        start = datetime.fromtimestamp(s.start, timezone.utc)
-        end = start + timedelta(seconds=s.duration or 5400)
-        kyiv = start.astimezone(KYIV).strftime("%d.%m %H:%M")
+    """Проверки через N минут после начала. Если момент прошёл, а пара ещё идёт — ближайшая минута.
+    Проверки на одну минуту склеиваются."""
+    jobs: dict[datetime, Job] = {}
+    for sl in slots:
+        sl.checks = []
         for off in offsets:
-            t = start + timedelta(minutes=off)
+            t = sl.start + timedelta(minutes=off)
+            if t >= sl.end:
+                continue
             if t <= now:
-                if now + timedelta(minutes=5) < end:
+                if now + timedelta(minutes=5) < sl.end:
                     t = now + timedelta(minutes=1)
                 else:
                     continue
             if t > now + horizon:
                 continue
             t = t.replace(second=0, microsecond=0)
-            jobs[(s.cmid, t)] = Job(t, s.cmid, f"{s.name} {kyiv} (Київ)", s.name, start)
+            if t in sl.checks:
+                continue
+            sl.checks.append(t)
+            j = jobs.setdefault(t, Job(t, set(), []))
+            if sl.cmids is None or j.cmids is None:
+                j.cmids = None
+            else:
+                j.cmids |= sl.cmids
+            j.labels.append(sl.label)
     return sorted(jobs.values(), key=lambda j: j.when)
 
 
@@ -271,12 +323,16 @@ def _cron_time(t: datetime) -> str:
 
 
 def render_cron_block(jobs: list[Job], runner: str, wake: str | None = None,
-                      now: datetime | None = None) -> str:
-    """wake — путь к termux/wake.sh: добавить включение/выключение wake lock вокруг пар."""
+                      now: datetime | None = None, known: list[str] | None = None) -> str:
+    """wake — путь к termux/wake.sh: добавить включение/выключение wake lock вокруг пар.
+    known — все известные журналы (для проверок по паре из CIST)."""
     lines = [CRON_BEGIN]
     events: list[tuple[datetime, str, str]] = []
     for j in jobs:
-        events.append((j.when, f"# {j.label.replace('%', '')}", f"{_cron_time(j.when)} {runner} --only {j.cmid}"))
+        ids = sorted(j.cmids) if j.cmids is not None else (known or [])
+        arg = f" --only {','.join(ids)}" if ids else ""
+        comment = "# " + "; ".join(j.labels).replace("%", "")
+        events.append((j.when, comment, f"{_cron_time(j.when)} {runner}{arg}"))
     if wake:
         for a, b in wake_windows(jobs):
             if now is None or a > now:
@@ -347,16 +403,32 @@ class Nure:
     def attendance_cmids(self, course_id: int) -> list[str]:
         return parse_attendance_cmids(self.get(f"/mod/attendance/index.php?id={course_id}").text)
 
-    def calendar_sessions(self, now: datetime, horizon: timedelta) -> list[CalSession]:
+    def calendar_sessions(self, now: datetime, horizon: timedelta,
+                          back: timedelta = timedelta(0)) -> list[CalSession]:
         months = sorted({(d.year, d.month) for d in
-                         (now.astimezone(KYIV), (now + horizon).astimezone(KYIV))})
+                         ((now - back).astimezone(KYIV), now.astimezone(KYIV),
+                          (now + horizon).astimezone(KYIV))})
         out: list[CalSession] = []
         for y, m in months:
             data = self.ajax("core_calendar_get_calendar_monthly_view",
                              {"year": y, "month": m, "courseid": 1, "categoryid": 0,
                               "includenavigation": False, "mini": False, "day": 1})
             out += parse_calendar_month(data)
-        return out
+        uniq = {(c.cmid, c.start): c for c in out}   # событие может попасть в два месяца
+        return list(uniq.values())
+
+    def cist_slots(self, group_id: str, now: datetime, days: int = 3) -> list[Slot]:
+        """Расписание группы из CIST (реальное, как в приложении NURE Timetable)."""
+        d0 = now.astimezone(KYIV).date()
+        d1 = d0 + timedelta(days=days)
+        r = self.s.get(CIST + "WEB_IAS_TT_GNR_RASP.GEN_GROUP_POTOK_RASP", timeout=TIMEOUT, params={
+            "ATypeDoc": 3, "Aid_group": group_id, "Aid_potok": 0,
+            "ADateStart": d0.strftime("%d.%m.%Y"), "ADateEnd": d1.strftime("%d.%m.%Y"), "AMultiWorkSheet": 0})
+        r.raise_for_status()
+        text = r.content.decode("cp1251", errors="replace")
+        if "Дата начала" not in text[:300]:
+            raise RuntimeError("CIST вернул не CSV")
+        return parse_cist_csv(text)
 
     def open_sessions(self, cmid: str) -> list[OpenSession]:
         r = self.get(f"/mod/attendance/view.php?id={cmid}&view=5")
@@ -450,61 +522,107 @@ def set_wake(wins: list[tuple[datetime, datetime]] | None, now: datetime) -> Non
         want = "lock" if any(a <= now <= b for a, b in wins) else "unlock"
     else:
         want = "unlock"
-    subprocess.run([wake, want], check=False)
-    print(f"wake lock: {want} (режим {mode})")
+    try:
+        subprocess.run([wake, want], check=False, timeout=30)
+        print(f"wake lock: {want} (режим {mode})")
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[wake] {e}", file=sys.stderr)
+
+
+def _load_json(name: str, default):
+    try:
+        with open(os.path.join(HERE, name), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _save_json(name: str, data) -> None:
+    try:
+        with open(os.path.join(HERE, name), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def known_journals(nure: Nure, cal: list[CalSession], skip: set[str]) -> tuple[list[str], dict]:
+    """Все журналы посещаемости: из календаря DL + обход курсов (раз в сутки, кэшируется)."""
+    cache = _load_json(".modules.json", {})
+    if time.time() - cache.get("ts", 0) > 20 * 3600:
+        try:
+            cache = {"ts": time.time(), "modules": discover_targets(nure)}
+            _save_json(".modules.json", cache)
+        except Exception as e:
+            print(f"[discover] {e}", file=sys.stderr)
+    labels = dict(cache.get("modules", {}))
+    labels.update({c.cmid: c.name for c in cal if c.name})
+    for cm in ids_from_env("ATTENDANCE_EXTRA_IDS"):
+        labels.setdefault(cm, "доп. модуль")
+    ids = sorted(cm for cm in labels if cm not in skip)
+    return ids, labels
 
 
 def run_plan(nure: Nure, apply: bool) -> int:
-    offsets = [int(x) for x in os.getenv("ATTENDANCE_OFFSETS", "30").split(",") if x.strip()]
+    offsets = [int(x) for x in os.getenv("ATTENDANCE_OFFSETS", "30,60").split(",") if x.strip()]
+    sources = os.getenv("ATTENDANCE_SOURCES", "cist,dl").lower()
+    group = os.getenv("CIST_GROUP_ID", "12410692")   # СШІм-26-1
     skip = set(ids_from_env("ATTENDANCE_SKIP_IDS"))
     now = datetime.now(timezone.utc)
     horizon = timedelta(hours=36)
-    sessions = [s for s in nure.calendar_sessions(now, horizon) if s.cmid not in skip]
-    jobs = build_jobs(sessions, now, offsets, horizon)
+
+    cal = nure.calendar_sessions(now, horizon, back=timedelta(days=31))
+    known, labels = known_journals(nure, cal, skip)
+
+    cist: list[Slot] = []
+    if "cist" in sources:
+        try:
+            cist = nure.cist_slots(group, now)
+            _save_json(".cist_cache.json", [[x.start.timestamp(), x.end.timestamp(), x.label] for x in cist])
+        except Exception as e:
+            print(f"[cist] {e} — беру последнее сохранённое расписание", file=sys.stderr)
+            cist = [Slot(datetime.fromtimestamp(a, timezone.utc), datetime.fromtimestamp(b, timezone.utc),
+                         None, lab, "cist") for a, b, lab in _load_json(".cist_cache.json", [])]
+    dl = cal_to_slots([c for c in cal if c.cmid not in skip]) if "dl" in sources else []
+    slots = [x for x in merge_slots(cist, dl) if x.end > now and x.start < now + horizon]
+    jobs = build_jobs(slots, now, offsets, horizon)
 
     runner = os.path.join(HERE, "termux", "run.sh")
-    print(f"Занятий в календаре (±месяц): {len(sessions)}, проверок в ближайшие 36 ч: {len(jobs)}")
+    print(f"Пар CIST: {len(cist)}, занятий DL: {len(dl)}, журналов: {known}; проверок за 36 ч: {len(jobs)}")
     for j in jobs:
-        print(f"  {j.when.astimezone():%d.%m %H:%M} (время устройства) — модуль {j.cmid}: {j.label}")
+        ids = "все журналы" if j.cmids is None else ",".join(sorted(j.cmids))
+        print(f"  {j.when.astimezone():%d.%m %H:%M} (время устройства) — {ids}: {'; '.join(j.labels)}")
 
     wd = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
-    summary = "\n".join(
-        f"• {wd[j.start.astimezone(KYIV).weekday()]} {j.start.astimezone(KYIV):%d.%m %H:%M} {j.course}"
-        f" → проверка в {j.when.astimezone(KYIV):%H:%M}" for j in jobs) or "• пар нет"
-    state = os.path.join(HERE, ".plan_state")
-    try:
-        old = open(state, encoding="utf-8").read()
-    except OSError:
-        old = None
+    lines = []
+    for sl in slots:
+        if not sl.checks:
+            continue
+        st = sl.start.astimezone(KYIV)
+        tag = "" if sl.source == "cist" else " (только занятие в DL)"
+        lines.append(f"• {wd[st.weekday()]} {st:%d.%m %H:%M} {sl.label}{tag} → "
+                     + ", ".join(f"{t.astimezone(KYIV):%H:%M}" for t in sl.checks))
+    summary = "\n".join(lines) or "• пар нет"
+    old = _load_json(".plan_state.json", {}).get("summary")
 
-    labels = {s.cmid: s.name for s in sessions if s.name}
     if apply:
-        try:
-            with open(os.path.join(HERE, ".labels.json"), "w", encoding="utf-8") as f:
-                json.dump(labels, f, ensure_ascii=False)
-        except OSError:
-            pass
+        _save_json(".labels.json", labels)
         if not shutil.which("crontab"):
             print("crontab не найден — --apply работает только в Termux/Linux", file=sys.stderr)
             return 2
         mode = os.getenv("ATTENDANCE_WAKELOCK", "smart").lower()  # smart | always | off
         wake = os.path.join(HERE, "termux", "wake.sh")
         cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
-        new = replace_cron_block(cur, render_cron_block(jobs, runner, wake if mode == "smart" else None, now))
+        new = replace_cron_block(cur, render_cron_block(jobs, runner, wake if mode == "smart" else None,
+                                                        now, known))
         subprocess.run(["crontab", "-"], input=new, text=True, check=True)
         print("crontab обновлён")
         wins = wake_windows(jobs)
-        try:
-            with open(os.path.join(HERE, ".wake_windows.json"), "w") as f:
-                json.dump([[a.timestamp(), b.timestamp()] for a, b in wins], f)
-        except OSError:
-            pass
+        _save_json(".wake_windows.json", [[a.timestamp(), b.timestamp()] for a, b in wins])
         set_wake(wins, now)
         if summary != old:
-            telegram(f"📅 План на 36 ч (время Киева):\n{summary}",
+            telegram(f"📅 План на 36 ч (Киев), проверки через {'/'.join(map(str, offsets))} мин:\n{summary}",
                      silent=True)
-            with open(state, "w", encoding="utf-8") as f:
-                f.write(summary)
+            _save_json(".plan_state.json", {"summary": summary})
     return 0
 
 
@@ -582,7 +700,7 @@ def main() -> int:
 
     if not found:
         print("Открытых сессий нет.")
-        what = ", ".join(targets.values()) if args.only else f"проверено модулей: {len(targets) - len(skip & targets.keys())}"
+        what = (", ".join(targets.values()) if len(targets) <= 2 else f"журналов: {len(targets)}") if args.only else f"проверено модулей: {len(targets) - len(skip & targets.keys())}"
         telegram(f"🔍 {kyiv_now()} — кнопки «Відмітитися» нет ({what}). "
                  f"Если пара идёт — возможно, уже отмечено или преподаватель не открыл отметку.",
                  silent=True)
