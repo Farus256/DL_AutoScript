@@ -21,10 +21,37 @@
 ## Где запускать
 
 dl.nure.ua закрыт AWS WAF: с IP дата-центров (GitHub Actions, облака, VPS) вместо сайта приходит
-страница «Human Verification» (HTTP 405). С домашнего интернета проверки нет — поэтому скрипт
-запускается на твоём ПК через Планировщик Windows. ПК должен быть включён во время пар.
+страница «Human Verification» (HTTP 405). С домашнего/мобильного интернета проверки нет — поэтому
+скрипт запускается на своём устройстве: **Android-телефоне (рекомендуется, он онлайн 24/7)** или ПК.
 
-## Установка (Windows)
+## Установка на Android (Termux)
+
+1. Установи из **F-Droid** (не из Play Market — там другая подпись):
+   [Termux](https://f-droid.org/packages/com.termux/) и [Termux:Boot](https://f-droid.org/packages/com.termux.boot/).
+   Открой Termux:Boot один раз — так он получит разрешение на автозапуск.
+2. Настройки Android → Приложения → **Termux** → Батарея → **Без ограничений**
+   (на Xiaomi/Samsung ещё включить «Автозапуск» / убрать из «спящих приложений»). Без этого Android усыпит cron.
+3. В Termux:
+   ```
+   pkg install -y git
+   git clone https://github.com/Farus256/DL_AutoScript
+   cd DL_AutoScript
+   bash termux/setup.sh
+   nano .env                              # логин, пароль, токен и chat_id; Ctrl+O, Enter, Ctrl+X
+   python nure_attendance.py --dry-run    # проверка: в Telegram придёт беззвучное 🔍
+   ```
+4. Всё. Cron запускает `termux/run.sh` Пн–Сб каждые 15 минут с 06:00 до 18:45 по времени телефона
+   (= 07–19:45 по Киеву). В шторке будет висеть уведомление Termux «wake lock held» — так и должно быть.
+
+Полезное:
+```
+crontab -l                 # расписание
+tail -n 30 attendance.log  # что было при последних запусках
+termux/run.sh              # запустить прямо сейчас (как cron)
+git pull                   # обновить скрипт
+```
+
+## Установка на ПК (Windows)
 
 1. Python 3.10+ с [python.org](https://www.python.org/downloads/) — при установке отметь **Add python.exe to PATH**.
 2. Склонируй/скачай репозиторий в папку, например `D:\DL_NureAttendance`.
