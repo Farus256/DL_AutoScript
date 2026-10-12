@@ -11,14 +11,19 @@
   5. проверяет, что кнопка исчезла, и шлёт итог в Telegram (опционально).
 
 Запуск:
-  python nure_attendance.py            # отметиться везде, где сейчас открыто
-  python nure_attendance.py --dry-run  # только показать, что нашлось, ничего не нажимать
+  python nure_attendance.py                 # обойти все курсы и отметиться, где открыто
+  python nure_attendance.py --dry-run       # только показать, что нашлось, ничего не нажимать
+  python nure_attendance.py --only 857821   # проверить только этот модуль (так зовёт cron)
+  python nure_attendance.py --plan          # показать план проверок по календарю DL
+  python nure_attendance.py --plan --apply  # записать план в crontab (Termux/Linux)
 
 Переменные окружения (или файл .env рядом):
   NURE_USERNAME, NURE_PASSWORD          — обязательно
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  — опционально, для уведомлений
   ATTENDANCE_EXTRA_IDS                  — опционально, доп. id модулей через запятую
   ATTENDANCE_SKIP_IDS                   — опционально, id модулей, которые не трогать
+  ATTENDANCE_OFFSETS                    — через сколько минут после начала пары проверять
+                                          (через запятую, по умолчанию "30")
 """
 from __future__ import annotations
 
@@ -26,9 +31,11 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
@@ -39,6 +46,11 @@ from urllib3.util.retry import Retry
 BASE = "https://dl.nure.ua"
 TIMEOUT = 30
 PRESENT_RE = re.compile(r"присутн|present", re.I)
+try:
+    from zoneinfo import ZoneInfo
+    KYIV = ZoneInfo("Europe/Kyiv")
+except Exception:  # Windows без пакета tzdata
+    KYIV = timezone(timedelta(hours=2))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/129.0 Safari/537.36")
 
@@ -176,6 +188,82 @@ def parse_moodle_error(html: str) -> str | None:
     return el.get_text(" ", strip=True)[:300] if el else None
 
 
+@dataclass
+class CalSession:
+    cmid: str
+    course_id: int
+    start: int          # unix time
+    duration: int       # секунды
+    name: str = ""
+
+
+def parse_calendar_month(data: dict) -> list[CalSession]:
+    """Ответ core_calendar_get_calendar_monthly_view -> занятия посещаемости."""
+    out = []
+    for week in data.get("weeks", []):
+        for day in week.get("days", []):
+            for e in day.get("events", []):
+                if e.get("modulename") != "attendance":
+                    continue
+                m = re.search(r"attendance/view\.php\?id=(\d+)", e.get("url") or "")
+                if not m:
+                    continue
+                out.append(CalSession(m.group(1), (e.get("course") or {}).get("id", 0),
+                                      int(e["timestart"]), int(e.get("timeduration") or 0),
+                                      (e.get("course") or {}).get("fullname", "")))
+    return out
+
+
+@dataclass
+class Job:
+    when: datetime      # aware, UTC — момент проверки
+    cmid: str
+    label: str
+    course: str = ""
+    start: datetime | None = None
+
+
+def build_jobs(sessions: list[CalSession], now: datetime, offsets: list[int],
+               horizon: timedelta = timedelta(hours=36)) -> list[Job]:
+    """Проверка через N минут после начала. Если момент уже прошёл, но пара ещё идёт — ближайшая минута."""
+    jobs: dict[tuple, Job] = {}
+    for s in sessions:
+        start = datetime.fromtimestamp(s.start, timezone.utc)
+        end = start + timedelta(seconds=s.duration or 5400)
+        kyiv = start.astimezone(KYIV).strftime("%d.%m %H:%M")
+        for off in offsets:
+            t = start + timedelta(minutes=off)
+            if t <= now:
+                if now + timedelta(minutes=5) < end:
+                    t = now + timedelta(minutes=1)
+                else:
+                    continue
+            if t > now + horizon:
+                continue
+            t = t.replace(second=0, microsecond=0)
+            jobs[(s.cmid, t)] = Job(t, s.cmid, f"{s.name} {kyiv} (Київ)", s.name, start)
+    return sorted(jobs.values(), key=lambda j: j.when)
+
+
+CRON_BEGIN, CRON_END = "# >>> nure-attendance plan >>>", "# <<< nure-attendance plan <<<"
+
+
+def render_cron_block(jobs: list[Job], runner: str) -> str:
+    lines = [CRON_BEGIN]
+    for j in jobs:
+        lt = j.when.astimezone()  # время телефона — cron живёт в нём
+        lines.append(f"# {j.label.replace('%', '')}")
+        lines.append(f"{lt.minute} {lt.hour} {lt.day} {lt.month} * {runner} --only {j.cmid}")
+    lines.append(CRON_END)
+    return "\n".join(lines)
+
+
+def replace_cron_block(crontab: str, block: str) -> str:
+    pat = re.compile(re.escape(CRON_BEGIN) + r".*?" + re.escape(CRON_END) + r"\n?", re.S)
+    rest = pat.sub("", crontab).rstrip("\n")
+    return (rest + "\n" if rest else "") + block + "\n"
+
+
 # --------------------------------------------------------------------------- #
 # Клиент
 # --------------------------------------------------------------------------- #
@@ -229,6 +317,17 @@ class Nure:
     def attendance_cmids(self, course_id: int) -> list[str]:
         return parse_attendance_cmids(self.get(f"/mod/attendance/index.php?id={course_id}").text)
 
+    def calendar_sessions(self, now: datetime, horizon: timedelta) -> list[CalSession]:
+        months = sorted({(d.year, d.month) for d in
+                         (now.astimezone(KYIV), (now + horizon).astimezone(KYIV))})
+        out: list[CalSession] = []
+        for y, m in months:
+            data = self.ajax("core_calendar_get_calendar_monthly_view",
+                             {"year": y, "month": m, "courseid": 1, "categoryid": 0,
+                              "includenavigation": False, "mini": False, "day": 1})
+            out += parse_calendar_month(data)
+        return out
+
     def open_sessions(self, cmid: str) -> list[OpenSession]:
         r = self.get(f"/mod/attendance/view.php?id={cmid}&view=5")
         return parse_open_sessions(r.text, r.url)
@@ -260,11 +359,7 @@ class Nure:
 
 
 def kyiv_now() -> str:
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%H:%M")
-    except Exception:  # на Windows без пакета tzdata
-        return datetime.now(timezone.utc).strftime("%H:%M UTC")
+    return datetime.now(KYIV).strftime("%H:%M")
 
 
 def telegram(text: str, silent: bool = False) -> None:
@@ -281,16 +376,85 @@ def telegram(text: str, silent: bool = False) -> None:
         print(f"[telegram] {e}", file=sys.stderr)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="ничего не нажимать, только показать")
-    args = ap.parse_args()
-    if sys.stdout is None:  # запуск через pythonw (Планировщик) — пишем лог в файл
-        log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attendance.log")
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def setup_logging_for_pythonw() -> None:
+    if sys.stdout is None:  # запуск через pythonw (Планировщик Windows) — пишем лог в файл
+        log = os.path.join(HERE, "attendance.log")
         if os.path.exists(log) and os.path.getsize(log) > 1_000_000:
             os.replace(log, log + ".old")
         sys.stdout = sys.stderr = open(log, "a", encoding="utf-8", buffering=1)
         print(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} ===")
+
+
+def discover_targets(nure: Nure) -> dict[str, str]:
+    targets: dict[str, str] = {cm: "доп. модуль" for cm in ids_from_env("ATTENDANCE_EXTRA_IDS")}
+    for c in nure.current_courses():
+        try:
+            cms = nure.attendance_cmids(c["id"])
+        except Exception as e:
+            print(f"[course {c['id']}] {e}", file=sys.stderr)
+            continue
+        print(f"Курс {c['id']}: {c['name']} — модули посещаемости: {cms or 'нет'}")
+        for cm in cms:
+            targets.setdefault(cm, c["name"])
+    return targets
+
+
+def run_plan(nure: Nure, apply: bool) -> int:
+    offsets = [int(x) for x in os.getenv("ATTENDANCE_OFFSETS", "30").split(",") if x.strip()]
+    skip = set(ids_from_env("ATTENDANCE_SKIP_IDS"))
+    now = datetime.now(timezone.utc)
+    horizon = timedelta(hours=36)
+    sessions = [s for s in nure.calendar_sessions(now, horizon) if s.cmid not in skip]
+    jobs = build_jobs(sessions, now, offsets, horizon)
+
+    runner = os.path.join(HERE, "termux", "run.sh")
+    print(f"Занятий в календаре (±месяц): {len(sessions)}, проверок в ближайшие 36 ч: {len(jobs)}")
+    for j in jobs:
+        print(f"  {j.when.astimezone():%d.%m %H:%M} (время устройства) — модуль {j.cmid}: {j.label}")
+
+    wd = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
+    summary = "\n".join(
+        f"• {wd[j.start.astimezone(KYIV).weekday()]} {j.start.astimezone(KYIV):%d.%m %H:%M} {j.course}"
+        f" → проверка в {j.when.astimezone(KYIV):%H:%M}" for j in jobs) or "• пар нет"
+    state = os.path.join(HERE, ".plan_state")
+    try:
+        old = open(state, encoding="utf-8").read()
+    except OSError:
+        old = None
+
+    labels = {s.cmid: s.name for s in sessions if s.name}
+    if apply:
+        try:
+            with open(os.path.join(HERE, ".labels.json"), "w", encoding="utf-8") as f:
+                json.dump(labels, f, ensure_ascii=False)
+        except OSError:
+            pass
+        if not shutil.which("crontab"):
+            print("crontab не найден — --apply работает только в Termux/Linux", file=sys.stderr)
+            return 2
+        cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+        new = replace_cron_block(cur, render_cron_block(jobs, runner))
+        subprocess.run(["crontab", "-"], input=new, text=True, check=True)
+        print("crontab обновлён")
+        if summary != old:
+            telegram(f"📅 План на 36 ч (время Киева):\n{summary}",
+                     silent=True)
+            with open(state, "w", encoding="utf-8") as f:
+                f.write(summary)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="ничего не нажимать, только показать")
+    ap.add_argument("--only", help="id модулей через запятую — проверить только их")
+    ap.add_argument("--plan", action="store_true", help="построить план проверок по календарю DL")
+    ap.add_argument("--apply", action="store_true", help="с --plan: записать план в crontab")
+    args = ap.parse_args()
+    setup_logging_for_pythonw()
     load_dotenv()
 
     user, pwd = os.getenv("NURE_USERNAME"), os.getenv("NURE_PASSWORD")
@@ -306,17 +470,25 @@ def main() -> int:
         telegram(f"⚠️ NURE: не удалось войти — {e}")
         return 1
 
-    skip = set(ids_from_env("ATTENDANCE_SKIP_IDS"))
-    targets: dict[str, str] = {cm: "доп. модуль" for cm in ids_from_env("ATTENDANCE_EXTRA_IDS")}
-    for c in nure.current_courses():
+    if args.plan:
         try:
-            cms = nure.attendance_cmids(c["id"])
+            return run_plan(nure, args.apply)
         except Exception as e:
-            print(f"[course {c['id']}] {e}", file=sys.stderr)
-            continue
-        print(f"Курс {c['id']}: {c['name']} — модули посещаемости: {cms or 'нет'}")
-        for cm in cms:
-            targets.setdefault(cm, c["name"])
+            print(f"[plan] {e}", file=sys.stderr)
+            telegram(f"⚠️ NURE: не удалось построить план — {e}")
+            return 1
+
+    skip = set(ids_from_env("ATTENDANCE_SKIP_IDS"))
+    if args.only:
+        # Только нужные модули — без обхода всех курсов (быстро и мало трафика)
+        try:
+            labels = json.load(open(os.path.join(HERE, ".labels.json"), encoding="utf-8"))
+        except (OSError, ValueError):
+            labels = {}
+        targets = {cm.strip(): labels.get(cm.strip(), f"модуль {cm.strip()}")
+                   for cm in args.only.split(",") if cm.strip()}
+    else:
+        targets = discover_targets(nure)
 
     marked, manual, problems, dry, found = [], [], [], [], 0
     for cm, course in targets.items():
@@ -343,10 +515,12 @@ def main() -> int:
             bucket.append(f"{label}: {info}")
             print(f"{icon} {label}: {info}")
 
-    checked = f"проверено модулей: {len(targets) - len(skip & targets.keys())}"
     if not found:
         print("Открытых сессий нет.")
-        telegram(f"🔍 {kyiv_now()} — проверка прошла, открытых сессий нет ({checked})", silent=True)
+        what = ", ".join(targets.values()) if args.only else f"проверено модулей: {len(targets) - len(skip & targets.keys())}"
+        telegram(f"🔍 {kyiv_now()} — кнопки «Відмітитися» нет ({what}). "
+                 f"Если пара идёт — возможно, уже отмечено или преподаватель не открыл отметку.",
+                 silent=True)
     elif dry:
         telegram(f"🧪 {kyiv_now()} — dry-run, открыты:\n" + "\n".join(dry), silent=True)
     msg = "\n".join(
