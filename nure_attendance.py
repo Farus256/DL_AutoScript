@@ -192,6 +192,8 @@ class Nure:
 
     def get(self, path: str, **kw) -> requests.Response:
         r = self.s.get(urljoin(BASE, path), timeout=TIMEOUT, **kw)
+        if r.status_code == 405 and "Human Verification" in r.text:
+            raise RuntimeError("AWS WAF показал капчу (IP дата-центра) — запускай с домашнего ПК")
         r.raise_for_status()
         return r
 
@@ -283,6 +285,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="ничего не нажимать, только показать")
     args = ap.parse_args()
+    if sys.stdout is None:  # запуск через pythonw (Планировщик) — пишем лог в файл
+        log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attendance.log")
+        if os.path.exists(log) and os.path.getsize(log) > 1_000_000:
+            os.replace(log, log + ".old")
+        sys.stdout = sys.stderr = open(log, "a", encoding="utf-8", buffering=1)
+        print(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} ===")
     load_dotenv()
 
     user, pwd = os.getenv("NURE_USERNAME"), os.getenv("NURE_PASSWORD")

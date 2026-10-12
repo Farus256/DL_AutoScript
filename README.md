@@ -18,29 +18,53 @@
 
 Сессии с QR-кодом или паролем от преподавателя автоматически отметить нельзя — скрипт пришлёт «✋ нужно вручную».
 
-## 1. Проверка локально (один раз)
+## Где запускать
 
-```bash
-pip install -r requirements.txt
-copy .env.example .env      # и заполни NURE_USERNAME / NURE_PASSWORD
-python nure_attendance.py --dry-run
+dl.nure.ua закрыт AWS WAF: с IP дата-центров (GitHub Actions, облака, VPS) вместо сайта приходит
+страница «Human Verification» (HTTP 405). С домашнего интернета проверки нет — поэтому скрипт
+запускается на твоём ПК через Планировщик Windows. ПК должен быть включён во время пар.
+
+## Установка (Windows)
+
+1. Python 3.10+ с [python.org](https://www.python.org/downloads/) — при установке отметь **Add python.exe to PATH**.
+2. Склонируй/скачай репозиторий в папку, например `D:\DL_NureAttendance`.
+3. Создай `.env` по образцу `.env.example`:
+   ```
+   NURE_USERNAME=логин
+   NURE_PASSWORD=пароль
+   TELEGRAM_BOT_TOKEN=123456:ABC...
+   TELEGRAM_CHAT_ID=412345678
+   ```
+4. Проверка (в этой папке, в терминале):
+   ```
+   py -m pip install -r requirements.txt
+   py nure_attendance.py --dry-run
+   ```
+   Должен вывести курсы, а в Telegram придёт беззвучное 🔍 или 🧪.
+5. Расписание: правый клик по `install_task.ps1` → **Выполнить с помощью PowerShell**
+   (или `powershell -ExecutionPolicy Bypass -File install_task.ps1`).
+   Задача «NURE attendance»: Пн–Сб, 06:00–19:00 по немецкому времени (= 07–20 по Киеву), каждые 15 минут,
+   без всплывающих окон. Лог — `attendance.log` рядом со скриптом.
+
+Управление задачей (PowerShell):
+```
+Start-ScheduledTask 'NURE attendance'                      # запустить сейчас
+Get-ScheduledTaskInfo 'NURE attendance'                    # когда запускалась, код возврата
+Unregister-ScheduledTask 'NURE attendance' -Confirm:$false # удалить
 ```
 
-Должен вывести список курсов и модулей. `--dry-run` ничего не нажимает.
+## Telegram
 
-## 2. GitHub Actions
+- `TELEGRAM_BOT_TOKEN` — @BotFather → `/mybots` → бот → API Token.
+- `TELEGRAM_CHAT_ID` — кому слать: свой числовой ID из [@userinfobot](https://t.me/userinfobot).
+  У своего бота обязательно нажми **Start**, иначе он не сможет написать первым.
 
-1. Положи эти файлы в репозиторий (например, вместо старого `DL_AutoScript`).
-2. **Settings → Secrets and variables → Actions → New repository secret**:
-   - `NURE_USERNAME`, `NURE_PASSWORD` — обязательно
-   - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — по желанию
-3. По желанию, там же во вкладке **Variables**: `ATTENDANCE_EXTRA_IDS` / `ATTENDANCE_SKIP_IDS` — id модулей через запятую.
-4. **Actions → NURE attendance → Run workflow** (галка dry run включена) — проверка, что GitHub достукивается до dl.nure.ua.
-5. Дальше работает само: Пн–Сб, каждые 15 минут с 05:00 до 17:59 UTC (`.github/workflows/attendance.yml`).
+## Переменные
 
-Заметки:
-- В публичном репозитории минуты Actions бесплатны без лимита; в приватном расписание укладывается примерно
-  в 1300 из 2000 бесплатных минут в месяц.
-- GitHub может задерживать cron на 5–20 минут — для пар по 95+ минут это не критично.
-- Workflow сам продлевает себе жизнь (GitHub отключает cron после 60 дней без активности в репо).
-- Падение (exit 1, письмо от GitHub) — только при реальной ошибке: не вошёл, ошибка Moodle и т.п.
+| Имя | |
+|---|---|
+| `NURE_USERNAME`, `NURE_PASSWORD` | обязательно; пароль Moodle (не вход через Google) |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | уведомления, опционально |
+| `ATTENDANCE_EXTRA_IDS` / `ATTENDANCE_SKIP_IDS` | id модулей через запятую — добавить/исключить |
+
+`.github/workflows/attendance.yml` оставлен только для ручного запуска — с раннеров GitHub он упрётся в WAF.

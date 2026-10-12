@@ -1,10 +1,10 @@
 name: NURE attendance
 
 on:
-  schedule:
-    # Пн–Сб, 05:00–17:59 UTC (= 07–19 по Киеву зимой, 08–20 летом), каждые 15 минут.
-    # Минуты сдвинуты с :00, т.к. в начале часа GitHub сильнее задерживает cron.
-    - cron: '7,22,37,52 5-17 * * 1-6'
+  # Расписание отключено: dl.nure.ua (AWS WAF) отдаёт раннерам GitHub страницу
+  # "Human Verification" (HTTP 405). Скрипт запускается с домашнего ПК — см. README.
+  # schedule:
+  #   - cron: '7,22,37,52 5-17 * * 1-6'
   workflow_dispatch:
     inputs:
       dry_run:
