@@ -1,0 +1,53 @@
+name: NURE attendance
+
+on:
+  schedule:
+    # Пн–Сб, 05:00–17:59 UTC (= 07–19 по Киеву зимой, 08–20 летом), каждые 15 минут.
+    # Минуты сдвинуты с :00, т.к. в начале часа GitHub сильнее задерживает cron.
+    - cron: '7,22,37,52 5-17 * * 1-6'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Только показать открытые сессии, ничего не нажимать'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: write   # для keepalive (см. последний шаг)
+
+concurrency:
+  group: attendance
+  cancel-in-progress: false
+
+jobs:
+  mark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Mark attendance
+        env:
+          NURE_USERNAME: ${{ secrets.NURE_USERNAME }}
+          NURE_PASSWORD: ${{ secrets.NURE_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ATTENDANCE_EXTRA_IDS: ${{ vars.ATTENDANCE_EXTRA_IDS }}
+          ATTENDANCE_SKIP_IDS: ${{ vars.ATTENDANCE_SKIP_IDS }}
+        run: python nure_attendance.py ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      # GitHub отключает cron в репозиториях без активности 60 дней.
+      # Раз в день (первый запуск) дёргаем API enable — это сбрасывает счётчик.
+      - name: Keepalive
+        if: github.event_name == 'schedule' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%H%M)" -lt 0530 ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/attendance.yml/enable" || true
+          fi
